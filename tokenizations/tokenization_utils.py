@@ -1,16 +1,20 @@
-import random
-import time
+import torch
+from typing import Dict
+from tqdm import tqdm
+
+from tokenizations.hypernet_cache import LRU_Cache
+from datasets.formatting.formatting import LazyBatch
+
 from typing import Dict, Tuple
 
-import numpy as np
-import torch
-from datasets import Dataset
-from datasets.formatting.formatting import LazyBatch
-from tokenizations.dynamic_bpe import Dynamic_BPE
-from tokenizations.hypernet_cache import LRU_Cache
-from tokenizations.tokenizers_utils import pretokenize, tokenize
-from tqdm import tqdm
 from zett.utils import get_surface_form_matrix
+from tokenizations.dynamic_bpe import Dynamic_BPE
+from datasets import Dataset
+import numpy as np
+import time
+from tokenizations.tokenizers_utils import tokenize, pretokenize
+
+import random
 
 
 class DatasetEncoder:
@@ -24,7 +28,7 @@ class DatasetEncoder:
         source_embeddings: torch.tensor = torch.tensor([]),
         embeddings_cache: LRU_Cache = None,
         exp_type: str = "",
-        bpe_tokenizer_boundary: str = "",
+        bpe_tokenizer_boundary: str = "pretokens",
         merges: int = None,
         collect_extra_data: bool = False,
     ) -> None:
@@ -105,12 +109,13 @@ class DatasetEncoder:
                     surface_forms[special_tokens_mask, 0]
                 ]
             else:
+                # Should be 4096 for Mistral. If this is not set, for special tokens we have embeddings of shape (1, 8192) and (1, 4096) for the rest of the tokens. This is because the source embeddings are concatenated
                 hypernet_preds[special_tokens_mask] = self.source_embeddings[
                     surface_forms[special_tokens_mask, 0], : hypernet_preds.shape[1]
-                ]  # Should be 4096 for Mistral. If this is not set, for special tokens we have embeddings of shape (1, 8192) and (1, 4096) for the rest of the tokens. This is because the source embeddings are concatenated
+                ]
             self.embeddings_cache.put(tokens_to_process, hypernet_preds)
         self.embeddings_cache.move_tokens_to_end(tokens_to_move_to_end)
-
+        
     def encode_examples_unique_tokens_lru(
         self,
         examples: LazyBatch,
@@ -134,18 +139,25 @@ class DatasetEncoder:
         max_batch_length = 0
 
         with torch.no_grad():
-            if self.exp_type == "dynamic_bpe":
+            if self.exp_type == "dynamic_bpe" or self.exp_type == "fvt_dynamic_bpe":
                 ner = task == "ner"
+                nli = task == "nli"
+                mmlu = task == "mmlu"
                 batch_tokens, unique_tokens, batch_seq_lengths, batch_word_ids = (
                     self.dynamic_bpe.tokenize_batch(
                         batch_examples=examples,
                         max_nr_merges=merges,
                         mlm=False,
                         ner=ner,
+                        nli=nli,
+                        mmlu=mmlu,
+                        max_length=max_length,
                     )
                 )
                 if self.collect_extra_data:
                     self.seq_lengths.extend(batch_seq_lengths)
+                for sample in batch_tokens:
+                    max_batch_length = max(len(sample), max_batch_length)
             else:
                 if task == "nli":
                     if isinstance(examples, list):
@@ -182,6 +194,7 @@ class DatasetEncoder:
                             batch_tokens.append(tokens)
                     else:
                         for idx, _ in enumerate(examples["premise"]):
+                            random.seed(42)
                             if self.exp_type == "original_tk_hypernet":
                                 tokens = (
                                     ["<s>"]
@@ -288,11 +301,42 @@ class DatasetEncoder:
                             unique_tokens.update(tokens)
                             batch_tokens.append(tokens)
                             batch_word_ids.append(word_ids)
+                elif task == "mmlu":
+                    if isinstance(examples, list):
+                        for batch_example in examples:
+                            if (
+                                self.exp_type == "original_tk_hypernet"
+                                or self.exp_type == "lp_tk_hypernet"
+                            ):
+                                tokens = ["<s>"] + tokenize(
+                                    batch_example,
+                                    self.tokenizer,
+                                    max_length=max_length,
+                                    truncation=True,
+                                )
+                            elif (
+                                self.exp_type == "word_tk_hypernet"
+                                or self.exp_type == "fvt"
+                                or self.exp_type == "dynamic_bpe"
+                            ):
+                                tokens = ["<s>"] + pretokenize(
+                                    batch_example, self.tokenizer
+                                )
+                            if len(tokens) > max_length:
+                                tokens = tokens[:max_length]
+                            if self.collect_extra_data:
+                                self.seq_lengths.append(len(tokens))
+                            unique_tokens.update(tokens)
+                            batch_tokens.append(tokens)
+                            max_batch_length = max(len(tokens), max_batch_length)
+                    else:
+                        raise NotImplemented("This is not yet supported!")
                 else:
                     raise Exception("You must specify the type of task")
 
             unique_tokens.add(self.tokenizer.pad_token)
-            if self.exp_type != "fvt":
+
+            if self.exp_type != "fvt" and self.exp_type != "fvt_dynamic_bpe":
                 self.compute_tokens_batch_embeddings(unique_tokens, task=task)
 
                 hypernet_preds = self.embeddings_cache.hypernet_preds
@@ -330,11 +374,13 @@ class DatasetEncoder:
                     )
                     attention_masks.append(attention_mask)
 
-                if self.exp_type != "fvt":
+                if self.exp_type != "fvt" and self.exp_type != "fvt_dynamic_bpe":
                     sequence_indices = [token2idx[token] for token in tokens_sequence]
                     embeddings = hypernet_preds[sequence_indices]
                 else:
-                    embeddings = torch.zeros(max_length, 768, device=self.device)
+                    embeddings = torch.zeros(
+                        max_length, self.embeddings_cache.emb_size, device=self.device
+                    )
                     for i, token in enumerate(tokens_sequence):
                         decomposed = self.tokenizer._tokenizer.model.tokenize(token)
                         if not any(
@@ -357,15 +403,28 @@ class DatasetEncoder:
                 sequence_batch_embeddings.append(embeddings)
         if task == "nli" or task == "mmlu":
             if tokenise_idx != -1:
+                if task == "mmlu":
+                    return {
+                        "inputs_embeds": sequence_batch_embeddings[0],
+                        "attention_mask": attention_masks[0],
+                        "batch_tokens": batch_tokens,
+                    }
+                else:
+                    return {
+                        "inputs_embeds": sequence_batch_embeddings[0],
+                        "attention_mask": attention_masks[0],
+                    }
+            if task == "mmlu":
                 return {
-                    "inputs_embeds": sequence_batch_embeddings[0],
-                    "attention_mask": attention_masks[0],
+                    "inputs_embeds": torch.stack(sequence_batch_embeddings).to(self.device),
+                    "attention_mask": torch.stack(attention_masks).to(self.device),
+                    "batch_tokens": batch_tokens,
                 }
-            return {
-                "inputs_embeds": torch.stack(sequence_batch_embeddings).to(self.device),
-                "attention_mask": torch.stack(attention_masks).to(self.device),
-            }
-
+            else:
+                return {
+                    "inputs_embeds": torch.stack(sequence_batch_embeddings).to(self.device),
+                    "attention_mask": torch.stack(attention_masks).to(self.device),
+                }
         elif task == "ner":
             labels = []
             for i, label in enumerate(examples["ner_tags"]):
@@ -396,7 +455,7 @@ class DatasetEncoder:
                         device=self.device,
                     )
                 else:
-                    label_ids = torch.tensor(label_ids, device=self.device)
+                    label_ids = torch.tensor(label_ids[:max_length], device=self.device)
 
                 labels.append(label_ids)
             return {
@@ -501,6 +560,7 @@ class DatasetEncoder:
 
         attention_masks = []  # attention masks for each sequence in batch
 
+        # PADDING
         for idx, seq_tokens in enumerate(batch_tokens):
             attention_ones = len(seq_tokens)
             seq_tokens += [self.tokenizer.pad_token] * (max_length - len(seq_tokens))
@@ -554,7 +614,9 @@ class DatasetEncoder:
             embeddings = hypernet_preds[sequence_indices]
             embeddings_batch.append(embeddings)
 
-        return {
+        result = {
             "inputs_embeds": torch.stack(embeddings_batch),
             "attention_mask": torch.stack(attention_masks_batch),
         }
+
+        return result

@@ -7,6 +7,7 @@ class LRU_Cache:
     def __init__(self, cache_size: int, emb_size: int = 768, device: str = "cpu"):
         self.capacity = cache_size
         assert str(device) == "cuda" or "cuda" in str(device)
+        self.emb_size = emb_size
         self.hypernet_preds = torch.zeros(cache_size, emb_size).to(device)
         self.biases = torch.zeros(cache_size, 1).to(device)
         self.token2idx = OrderedDict()
@@ -52,7 +53,7 @@ class LRU_Cache:
                 evicted_tokens += 1
                 if evicted_tokens == nr_tokens_to_evict:
                     break
- 
+
         for token in tokens_to_remove:
             del self.token2idx[token]
 
