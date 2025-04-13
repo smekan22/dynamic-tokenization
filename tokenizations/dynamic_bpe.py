@@ -3,7 +3,7 @@ import string
 from collections import Counter, defaultdict
 from functools import lru_cache
 from typing import Dict, Tuple
-
+from itertools import chain
 from datasets.formatting.formatting import LazyBatch
 from tokenizations.tokenizers_utils import pretokenize, tokenize
 from tokenizers import pre_tokenizers
@@ -14,7 +14,12 @@ class Dynamic_BPE:
     def __init__(self, tokenizer, tokenizer_boundary: str = "pretokens"):
         self.tokenizer = tokenizer
         self.tokenizer_boundary = tokenizer_boundary
-        self.special_token_map = set(tokenizer.special_tokens_map.values())
+        self.special_token_map = set(
+            chain.from_iterable(
+                [v] if isinstance(v, str) else v if isinstance(v, list) else []
+                for v in tokenizer.special_tokens_map.values()
+            )
+        )
         self.punctuation_tokens = {
             token
             for token in tokenizer.vocab
